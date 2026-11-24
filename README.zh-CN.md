@@ -50,11 +50,17 @@ python3 radar.py list --verdict ACT_NOW --min-score 70
 
 编辑 `watchlists.json` 即可接入任意兼容接口（如 DeepSeek、OpenAI 或本地免费 Ollama `http://127.0.0.1:11434/v1`），并通过环境变量配置 **飞书机器人（`FEISHU_WEBHOOK_URL`）**、**Bark 苹果推送（`BARK_SERVER_URL`）**、**Telegram**、**Discord** 或 **Slack**。
 
-搭配系统 `crontab` 每 15 分钟巡检一次，高分机会出现秒级推送到手机，绝不重复打扰：
+用 `crontab` 每 15 分钟扫描一次，达到阈值的新条目会进入推送队列。
 
 ```cron
-*/15 * * * * cd /path/to/ai-signal-radar && /usr/bin/env python3 radar.py scan --config watchlists.json --db radar.db >> radar.log 2>&1
+*/15 * * * * cd /path/to/ai-signal-radar && /usr/bin/env python3 radar.py --config watchlists.json --db radar.db scan >> radar.log 2>&1
 ```
+
+`--config` 和 `--db` 可以放在 `scan` 前或后。显式指定配置文件时，文件必须存在。数据源、评分或推送出现错误时，扫描返回退出码 `1`，JSON 报告仍包含成功取得的结果。配置文件不可读或无效时返回 `2`。
+
+每个启用的推送渠道独立排队。某个渠道失败后，后续扫描会重试该渠道，即使原条目已经从数据源下架。确认送达的记录会出队。如果服务商已收到请求，而 Radar 还未记录成功就中断，重试时可能收到重复消息。旧数据库自动创建队列，升级前入库的历史条目继续保留原来的推送状态。
+
+Web 控制台默认仅监听本机，也没有内置登录功能。远程使用时请通过带身份验证的反向代理访问。
 
 ## 运行测试
 

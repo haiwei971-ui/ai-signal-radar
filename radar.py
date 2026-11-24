@@ -27,15 +27,19 @@ import re
 import sqlite3
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from contextlib import closing, contextmanager
+from dataclasses import asdict, dataclass, field, fields
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 USER_AGENT = f"ai-signal-radar/{VERSION} (+https://github.com/haiwei971-ui/ai-signal-radar)"
+NOTIFICATION_CHANNELS = ("telegram", "discord", "slack", "feishu", "bark")
+NOTIFICATION_LEASE_SECONDS = 300
 
 
 # --------------------------------------------------------------------------- #
@@ -243,8 +247,14 @@ def http_post_json(url: str, payload: Dict[str, Any], headers: Optional[Dict[str
         hdrs.update(headers)
     req = urllib.request.Request(url, data=body, headers=hdrs, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read().decode("utf-8", errors="replace")
-        return json.loads(raw) if raw.strip() else {}
+        raw = resp.read().decode("utf-8", errors="replace").strip()
+        return json.loads(raw) if raw and raw != "ok" else {}
+
+
+def request_error(exc: Exception) -> str:
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"HTTP {exc.code}"
+    return type(exc).__name__
 
 
 # --------------------------------------------------------------------------- #
@@ -629,7 +639,7 @@ def evaluate_signal(
             if llm_res is not None:
                 r_score, r_verdict, r_reason, r_action, scored_by = llm_res
         except Exception as exc:
-            r_reason = f"{r_reason} (LLM fallback: {clean_text(str(exc), 60)})"
+            r_reason = f"{r_reason} (LLM fallback: {request_error(exc)})"
 
     return ScoredSignal(
         fingerprint=sig.fingerprint(),
@@ -662,15 +672,16 @@ class SignalStore:
             os.makedirs(parent, exist_ok=True)
         self._init_db()
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA foreign_keys = ON")
-        return conn
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
+            yield conn
 
     def _init_db(self) -> None:
         with self._connect() as conn:
+            conn.execute("PRAGMA journal_mode = WAL")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS signals (
@@ -696,13 +707,21 @@ class SignalStore:
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_score ON signals(score DESC)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_status ON signals(status)")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS pending_notifications (
+                    fingerprint TEXT NOT NULL REFERENCES signals(fingerprint) ON DELETE CASCADE,
+                    channel TEXT NOT NULL,
+                    leased_until INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (fingerprint, channel)
+                )
+            """)
 
     def exists(self, fingerprint: str) -> bool:
         with self._connect() as conn:
             row = conn.execute("SELECT 1 FROM signals WHERE fingerprint = ?", (fingerprint,)).fetchone()
             return row is not None
 
-    def insert(self, item: ScoredSignal) -> bool:
+    def insert(self, item: ScoredSignal, channels: Iterable[str] = ()) -> bool:
         with self._connect() as conn:
             cur = conn.execute(
                 """
@@ -730,11 +749,57 @@ class SignalStore:
                     now_utc_iso(),
                 ),
             )
-            return cur.rowcount > 0
+            inserted = cur.rowcount > 0
+            if inserted:
+                conn.executemany(
+                    "INSERT INTO pending_notifications (fingerprint, channel) VALUES (?, ?)",
+                    ((item.fingerprint, channel) for channel in channels),
+                )
+            return inserted
 
     def mark_notified(self, fingerprint: str) -> None:
         with self._connect() as conn:
             conn.execute("UPDATE signals SET notified = 1 WHERE fingerprint = ?", (fingerprint,))
+
+    def pending_notifications(self, watchlists: Iterable[str], channels: Iterable[str]) -> List[sqlite3.Row]:
+        watchlists = tuple(watchlists)
+        channels = tuple(channels)
+        if not watchlists or not channels:
+            return []
+        with self._connect() as conn:
+            return conn.execute(
+                f"""
+                SELECT s.*, p.channel FROM pending_notifications p
+                JOIN signals s ON s.fingerprint = p.fingerprint
+                WHERE p.leased_until <= ?
+                  AND s.watchlist IN ({", ".join("?" for _ in watchlists)})
+                  AND p.channel IN ({", ".join("?" for _ in channels)})
+                ORDER BY s.discovered_at, s.fingerprint, p.channel
+                """,
+                (int(time.time()), *watchlists, *channels),
+            ).fetchall()
+
+    def claim_notification(self, fingerprint: str, channel: str) -> Optional[int]:
+        now = int(time.time())
+        lease = now + NOTIFICATION_LEASE_SECONDS
+        with self._connect() as conn:
+            result = conn.execute(
+                "UPDATE pending_notifications SET leased_until = ? "
+                "WHERE fingerprint = ? AND channel = ? AND leased_until <= ?",
+                (lease, fingerprint, channel, now),
+            )
+            return lease if result.rowcount else None
+
+    def finish_notification(self, fingerprint: str, channel: str, lease: int, sent: bool) -> None:
+        with self._connect() as conn:
+            key = (fingerprint, channel, lease)
+            where = "WHERE fingerprint = ? AND channel = ? AND leased_until = ?"
+            if sent:
+                result = conn.execute("DELETE FROM pending_notifications " + where, key)
+                if result.rowcount:
+                    conn.execute("UPDATE signals SET notified = 1 WHERE fingerprint = ?", (fingerprint,))
+            else:
+                conn.execute("UPDATE pending_notifications SET leased_until = 0 " + where, key)
 
     def update_status(self, fingerprint: str, status: str) -> bool:
         if status not in ("unread", "starred", "archived", "read"):
@@ -804,59 +869,57 @@ def format_alert_message(sig: ScoredSignal) -> str:
     )
 
 
+def send_notification(
+    sig: ScoredSignal,
+    channel: str,
+    channel_cfg: Dict[str, Any],
+    poster: Callable[[str, Dict[str, Any], Optional[Dict[str, str]]], Dict[str, Any]],
+) -> bool:
+    text = format_alert_message(sig)
+    if channel == "telegram":
+        token = os.environ.get(channel_cfg.get("bot_token_env", "TELEGRAM_BOT_TOKEN"), "").strip()
+        chat_id = os.environ.get(channel_cfg.get("chat_id_env", "TELEGRAM_CHAT_ID"), "").strip()
+        if not (token and chat_id):
+            return False
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
+    elif channel == "bark":
+        server = os.environ.get(channel_cfg.get("server_url_env", "BARK_SERVER_URL"), "").strip().rstrip("/")
+        if not server:
+            return False
+        url = f"{server}/push"
+        payload = {"title": f"[{sig.score}] {sig.watchlist}", "body": f"{sig.title}\n{sig.reason}", "url": sig.url}
+    else:
+        url = os.environ.get(channel_cfg.get("webhook_url_env", f"{channel.upper()}_WEBHOOK_URL"), "").strip()
+        if not url:
+            return False
+        if channel == "discord":
+            payload = {"content": text, "allowed_mentions": {"parse": []}}
+        elif channel == "slack":
+            payload = {"text": text}
+        else:
+            payload = {"msg_type": "text", "content": {"text": text}}
+
+    response = poster(url, payload, None)
+    if (
+        response.get("ok") is False
+        or (channel == "feishu" and response.get("code", response.get("StatusCode", 0)) != 0)
+        or (channel == "bark" and response.get("code", 200) != 200)
+    ):
+        raise RuntimeError("Provider rejected the notification")
+    return True
+
+
 def dispatch_notifications(
     sig: ScoredSignal,
     notif_cfg: Dict[str, Any],
     poster: Callable[[str, Dict[str, Any], Optional[Dict[str, str]]], Dict[str, Any]] = http_post_json,
 ) -> List[str]:
-    sent_channels: List[str] = []
-    text = format_alert_message(sig)
-
-    tg = notif_cfg.get("telegram") or {}
-    if tg.get("enabled"):
-        token = os.environ.get(tg.get("bot_token_env", "TELEGRAM_BOT_TOKEN"), "").strip()
-        chat_id = os.environ.get(tg.get("chat_id_env", "TELEGRAM_CHAT_ID"), "").strip()
-        if token and chat_id:
-            poster(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                {"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
-                None,
-            )
-            sent_channels.append("telegram")
-
-    dc = notif_cfg.get("discord") or {}
-    if dc.get("enabled"):
-        wh = os.environ.get(dc.get("webhook_url_env", "DISCORD_WEBHOOK_URL"), "").strip()
-        if wh:
-            poster(wh, {"content": text}, None)
-            sent_channels.append("discord")
-
-    sl = notif_cfg.get("slack") or {}
-    if sl.get("enabled"):
-        wh = os.environ.get(sl.get("webhook_url_env", "SLACK_WEBHOOK_URL"), "").strip()
-        if wh:
-            poster(wh, {"text": text}, None)
-            sent_channels.append("slack")
-
-    fs = notif_cfg.get("feishu") or {}
-    if fs.get("enabled"):
-        wh = os.environ.get(fs.get("webhook_url_env", "FEISHU_WEBHOOK_URL"), "").strip()
-        if wh:
-            poster(wh, {"msg_type": "text", "content": {"text": text}}, None)
-            sent_channels.append("feishu")
-
-    bk = notif_cfg.get("bark") or {}
-    if bk.get("enabled"):
-        srv = os.environ.get(bk.get("server_url_env", "BARK_SERVER_URL"), "").strip().rstrip("/")
-        if srv:
-            poster(
-                f"{srv}/push",
-                {"title": f"[{sig.score}] {sig.watchlist}", "body": f"{sig.title}\n{sig.reason}", "url": sig.url},
-                None,
-            )
-            sent_channels.append("bark")
-
-    return sent_channels
+    return [
+        channel for channel in NOTIFICATION_CHANNELS
+        if (notif_cfg.get(channel) or {}).get("enabled")
+        and send_notification(sig, channel, notif_cfg[channel], poster)
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -873,44 +936,63 @@ def run_scan(
 ) -> Dict[str, Any]:
     ai_cfg = cfg.get("ai") or {}
     notif_cfg = cfg.get("notifications") or {}
-    watchlists = cfg.get("watchlists") or []
+    channels = [channel for channel in NOTIFICATION_CHANNELS if (notif_cfg.get(channel) or {}).get("enabled")]
+    watchlists = [
+        wl for wl in (cfg.get("watchlists") or [])
+        if wl.get("enabled", True) and (not only_watchlist or wl.get("name") == only_watchlist)
+    ]
 
     fetched_count = 0
     inserted: List[Dict[str, Any]] = []
-    notified_count = 0
+    notified = set()
     errors: List[str] = []
 
+    if only_watchlist and not watchlists:
+        errors.append(f"Unknown or disabled watchlist: {only_watchlist}")
+
     for wl in watchlists:
-        name = wl.get("name", "")
-        if only_watchlist and name != only_watchlist:
-            continue
-        if wl.get("enabled", True) is False:
-            continue
+        name = wl.get("name", wl.get("type", "rss"))
         try:
             raw_items = fetch_watchlist(wl, fetcher=fetcher)
+            min_notify = int(wl.get("min_notify_score", 70))
         except Exception as exc:
-            errors.append(f"{name}: {exc}")
+            errors.append(f"{name}: {request_error(exc)}")
             continue
 
         fetched_count += len(raw_items)
-        min_notify = int(wl.get("min_notify_score", 70))
 
         for raw_sig in raw_items:
             fp = raw_sig.fingerprint()
             if store.exists(fp):
                 continue
-            scored = evaluate_signal(raw_sig, wl, ai_cfg, llm_poster=poster)
-            if store.insert(scored):
-                row = asdict(scored)
-                inserted.append(row)
-                if scored.score >= min_notify and scored.verdict != "SKIP":
-                    try:
-                        channels = dispatch_notifications(scored, notif_cfg, poster=poster)
-                        if channels:
-                            store.mark_notified(fp)
-                            notified_count += 1
-                    except Exception as exc:
-                        errors.append(f"notify({name}): {exc}")
+            try:
+                scored = evaluate_signal(raw_sig, wl, ai_cfg, llm_poster=poster)
+            except (TypeError, ValueError, AttributeError) as exc:
+                errors.append(f"score({name}, {fp}): {request_error(exc)}")
+                continue
+            eligible = scored.score >= min_notify and scored.verdict != "SKIP"
+            if store.insert(scored, channels if eligible else ()):
+                inserted.append(asdict(scored))
+
+    active_names = {wl.get("name", wl.get("type", "rss")) for wl in watchlists}
+    signal_fields = [f.name for f in fields(ScoredSignal)]
+    for row in store.pending_notifications(sorted(active_names), channels):
+        fp, channel = row["fingerprint"], row["channel"]
+        lease = store.claim_notification(fp, channel)
+        if lease is None:
+            continue
+        sig = ScoredSignal(**{name: row[name] for name in signal_fields})
+        sent = False
+        try:
+            sent = send_notification(sig, channel, notif_cfg[channel], poster)
+            if sent:
+                notified.add(fp)
+            else:
+                errors.append(f"notify({sig.watchlist}, {channel}): missing environment variables")
+        except Exception as exc:
+            errors.append(f"notify({sig.watchlist}, {channel}): {request_error(exc)}")
+        finally:
+            store.finish_notification(fp, channel, lease, sent)
 
     inserted.sort(key=lambda r: r["score"], reverse=True)
     return {
@@ -918,7 +1000,7 @@ def run_scan(
         "fetched": fetched_count,
         "new_signals": len(inserted),
         "act_now_new": sum(1 for r in inserted if r["verdict"] == "ACT_NOW"),
-        "notified": notified_count,
+        "notified": len(notified),
         "errors": errors,
         "items": inserted,
     }
@@ -1046,7 +1128,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 function esc(s) {
   const d = document.createElement('div');
   d.textContent = s == null ? '' : String(s);
-  return d.innerHTML;
+  return d.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+function linkFor(value, title) {
+  try {
+    const url = new URL(value);
+    if (url.protocol === 'https:' || url.protocol === 'http:') {
+      return `<a class="title" href="${esc(url.href)}" target="_blank" rel="noopener noreferrer">${esc(title)}</a>`;
+    }
+  } catch (_) {
+    // Entries without a valid public link still appear in the dashboard.
+  }
+  return `<span class="title">${esc(title)}</span>`;
 }
 async function loadSignals() {
   const wl = document.getElementById('fWatchlist').value;
@@ -1092,7 +1185,7 @@ async function loadSignals() {
           </div>
           <span class="sub">status: <b>${esc(it.status)}</b></span>
         </div>
-        <a class="title" href="${esc(it.url)}" target="_blank" rel="noopener noreferrer">${esc(it.title)}</a>
+        ${linkFor(it.url, it.title)}
         <div class="reason"><b>Why:</b> ${esc(it.reason)} &nbsp;|&nbsp; <b>Action:</b> ${esc(it.suggested_action)}</div>
         ${it.summary ? `<div class="summary">${esc(it.summary)}</div>` : ''}
         <div class="actions">
@@ -1115,8 +1208,11 @@ async function triggerScan() {
   const toast = document.getElementById('toast');
   btn.disabled = true; toast.textContent = 'Scanning feeds...';
   try {
-    const r = await fetch('/api/scan', {method: 'POST'}).then(x => x.json());
-    toast.textContent = `Fetched ${r.fetched}, +${r.new_signals} new (${r.act_now_new} ACT_NOW)`;
+    const response = await fetch('/api/scan', {method: 'POST'});
+    if (!response.ok) throw new Error('Scan request failed');
+    const r = await response.json();
+    const issues = r.errors.length ? ` · ${r.errors.length} issue(s): ${r.errors.join('; ')}` : '';
+    toast.textContent = `Fetched ${r.fetched}, +${r.new_signals} new (${r.act_now_new} ACT_NOW)${issues}`;
     await loadSignals();
   } catch (e) {
     toast.textContent = 'Scan error';
@@ -1161,12 +1257,20 @@ def make_handler(cfg: Dict[str, Any], store: SignalStore) -> type:
                 return
             if parsed.path == "/api/signals":
                 qs = urllib.parse.parse_qs(parsed.query)
+                try:
+                    min_score = int(qs.get("min_score", ["0"])[0])
+                    limit = int(qs.get("limit", ["100"])[0])
+                    if not (0 <= min_score <= 100 and 1 <= limit <= 1000):
+                        raise ValueError
+                except ValueError:
+                    self._send_json(400, {"error": "min_score must be 0–100 and limit must be 1–1000"})
+                    return
                 items = store.query(
                     watchlist=(qs.get("watchlist") or [""])[0],
                     verdict=(qs.get("verdict") or [""])[0],
                     status=(qs.get("status") or [""])[0],
-                    min_score=int((qs.get("min_score") or ["0"])[0] or 0),
-                    limit=int((qs.get("limit") or ["100"])[0] or 100),
+                    min_score=min_score,
+                    limit=limit,
                 )
                 self._send_json(200, {"items": items})
                 return
@@ -1174,12 +1278,31 @@ def make_handler(cfg: Dict[str, Any], store: SignalStore) -> type:
 
         def do_POST(self) -> None:
             parsed = urllib.parse.urlparse(self.path)
-            length = int(self.headers.get("Content-Length", "0") or 0)
+            origin = self.headers.get("Origin")
+            if origin and origin not in (f"http://{self.headers.get('Host')}", f"https://{self.headers.get('Host')}"):
+                self._send_json(403, {"error": "cross-origin write request"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length < 0:
+                    raise ValueError
+            except ValueError:
+                self._send_json(400, {"error": "invalid content length"})
+                return
+            if length > 8192:
+                self._send_json(413, {"error": "request body too large"})
+                return
+            if length and self.headers.get_content_type() != "application/json":
+                self._send_json(415, {"error": "expected application/json"})
+                return
             raw = self.rfile.read(length).decode("utf-8", errors="replace") if length > 0 else "{}"
             try:
                 body = json.loads(raw) if raw.strip() else {}
             except json.JSONDecodeError:
                 self._send_json(400, {"error": "invalid json"})
+                return
+            if not isinstance(body, dict):
+                self._send_json(400, {"error": "expected a JSON object"})
                 return
 
             if parsed.path == "/api/status":
@@ -1254,11 +1377,29 @@ DEMO_SIGNALS: List[Tuple[RawSignal, Dict[str, Any]]] = [
 ]
 
 
-def load_config(path: str) -> Dict[str, Any]:
-    if not os.path.exists(path):
-        return default_config()
-    with open(path, "r", encoding="utf-8") as fh:
-        return json.load(fh)
+def load_config(path: str, *, missing_ok: bool = True) -> Dict[str, Any]:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            cfg = json.load(fh)
+    except FileNotFoundError:
+        if missing_ok:
+            return default_config()
+        raise
+    if not isinstance(cfg, dict):
+        raise ValueError("configuration must be a JSON object")
+    watchlists = cfg.get("watchlists")
+    if watchlists is not None and (
+        not isinstance(watchlists, list) or any(not isinstance(wl, dict) for wl in watchlists)
+    ):
+        raise ValueError("watchlists must be an array of objects")
+    for section in ("ai", "notifications"):
+        if cfg.get(section) is not None and not isinstance(cfg[section], dict):
+            raise ValueError(f"{section} must be an object")
+    notif_cfg = cfg.get("notifications") or {}
+    for channel in NOTIFICATION_CHANNELS:
+        if notif_cfg.get(channel) is not None and not isinstance(notif_cfg[channel], dict):
+            raise ValueError(f"notifications.{channel} must be an object")
+    return cfg
 
 
 def print_table(items: List[Dict[str, Any]]) -> None:
@@ -1277,7 +1418,7 @@ def build_cli() -> argparse.ArgumentParser:
         prog="radar.py",
         description="ai-signal-radar: Self-hosted 24/7 AI Opportunity, Bounty, Lead & Deal Radar.",
     )
-    p.add_argument("--config", default="watchlists.json", help="Path to watchlists config JSON (default: watchlists.json)")
+    p.add_argument("--config", help="Path to watchlists config JSON (default: watchlists.json)")
     p.add_argument("--db", default="radar.db", help="Path to SQLite database (default: radar.db)")
     p.add_argument("--version", action="version", version=f"ai-signal-radar {VERSION}")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1307,12 +1448,17 @@ def build_cli() -> argparse.ArgumentParser:
     p_serve.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
     p_serve.add_argument("--port", type=int, default=8787, help="Bind port (default: 8787)")
 
+    for command in (p_init, p_scan, p_list, p_demo, p_serve):
+        command.add_argument("--config", default=argparse.SUPPRESS, help="Path to watchlists config JSON")
+        command.add_argument("--db", default=argparse.SUPPRESS, help="Path to SQLite database")
+
     return p
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_cli()
     args = parser.parse_args(argv)
+    config_path = args.config or "watchlists.json"
 
     if args.cmd == "presets":
         for key, val in BUILTIN_PRESETS.items():
@@ -1320,18 +1466,29 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     if args.cmd == "init":
-        if os.path.exists(args.config) and not args.force:
-            print(f"[radar] Config already exists: {args.config} (pass --force to overwrite)", file=sys.stderr)
-            return 1
         cfg = default_config()
         if args.presets:
             cfg["watchlists"] = [BUILTIN_PRESETS[k] for k in args.presets]
-        with open(args.config, "w", encoding="utf-8") as fh:
-            json.dump(cfg, fh, indent=2)
-        print(f"[radar] Wrote starter config to {args.config} ({len(cfg['watchlists'])} watchlists).")
+        try:
+            with open(config_path, "w" if args.force else "x", encoding="utf-8") as fh:
+                json.dump(cfg, fh, indent=2)
+                fh.write("\n")
+        except FileExistsError:
+            print(f"[radar] Config already exists: {config_path} (pass --force to overwrite)", file=sys.stderr)
+            return 1
+        except OSError as exc:
+            print(f"[radar] Could not write config {config_path}: {exc.strerror}", file=sys.stderr)
+            return 2
+        print(f"[radar] Wrote starter config to {config_path} ({len(cfg['watchlists'])} watchlists).")
         return 0
 
-    cfg = load_config(args.config)
+    cfg = {}
+    if args.cmd in ("scan", "serve"):
+        try:
+            cfg = load_config(config_path, missing_ok=args.config is None)
+        except (OSError, ValueError) as exc:
+            print(f"[radar] Could not load config {config_path}: {exc}", file=sys.stderr)
+            return 2
     store = SignalStore(args.db)
 
     if args.cmd == "demo":
@@ -1363,7 +1520,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 for err in report["errors"]:
                     print(f"  [warn] {err}", file=sys.stderr)
             print_table(report["items"][:15])
-        return 0
+        return 1 if report["errors"] else 0
 
     if args.cmd == "list":
         rows = store.query(
