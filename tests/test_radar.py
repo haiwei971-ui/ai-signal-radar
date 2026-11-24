@@ -215,6 +215,11 @@ class LlmScorerAndWebhookTests(unittest.TestCase):
         self.assertEqual(sent, ["telegram", "discord", "slack", "feishu", "bark"])
         self.assertEqual(len(calls), 5)
 
+    def test_slack_plain_text_success_is_accepted(self):
+        with mock.patch.object(radar.urllib.request, "urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value.read.return_value = b"ok\n"
+            self.assertEqual(radar.http_post_json("https://slack.example/noop", {"text": "test"}), {})
+
 
 class StoreScanWebAndCliTests(unittest.TestCase):
     def setUp(self):
@@ -254,6 +259,78 @@ class StoreScanWebAndCliTests(unittest.TestCase):
             self.assertEqual(r2["new_signals"], 0)
             self.assertEqual(r2["notified"], 0)
             self.assertEqual(len(posted), 1)
+
+    def test_failed_channel_retries_after_restart_without_resending_successful_channel(self):
+        channels = ("discord", "slack")
+        cfg = {
+            "watchlists": [radar.BUILTIN_PRESETS["github-bounties"]],
+            "notifications": {channel: {"enabled": True} for channel in channels},
+        }
+        urls = {channel: f"https://{channel}.example/test-webhook" for channel in channels}
+        env = {f"{channel.upper()}_WEBHOOK_URL": url for channel, url in urls.items()}
+        fetched = json.dumps(SAMPLE_GH_ISSUES).encode("utf-8")
+        attempts = []
+
+        def first_attempt(url, payload, headers):
+            attempts.append(url)
+            if url == urls["discord"]:
+                raise radar.urllib.error.HTTPError(url, 503, "Service unavailable", {}, None)
+            return {}
+
+        with mock.patch.dict(os.environ, env):
+            store = radar.SignalStore(self.db_path)
+            first = radar.run_scan(cfg, store, fetcher=lambda *_: fetched, poster=first_attempt)
+            self.assertEqual(first["notified"], 1)
+            self.assertEqual(first["errors"], ["notify(github-bounties, discord): HTTP 503"])
+            self.assertEqual(attempts, [urls["discord"], urls["slack"]])
+
+            store = radar.SignalStore(self.db_path)
+            second = radar.run_scan(
+                cfg, store, fetcher=lambda *_: b'{"items": []}',
+                poster=lambda url, *_: attempts.append(url) or {},
+            )
+            self.assertEqual(second["new_signals"], 0)
+            self.assertEqual(second["notified"], 1)
+            self.assertFalse(second["errors"])
+            self.assertEqual(attempts, [urls["discord"], urls["slack"], urls["discord"]])
+            self.assertEqual(store.query()[0]["notified"], 1)
+            self.assertEqual(store.pending_notifications(["github-bounties"], channels), [])
+
+    def test_delivery_claim_is_exclusive_and_can_be_recovered_after_expiry(self):
+        store1 = radar.SignalStore(self.db_path)
+        store2 = radar.SignalStore(self.db_path)
+        wl = radar.BUILTIN_PRESETS["github-bounties"]
+        sig = radar.evaluate_signal(
+            radar.parse_github_issues_json(SAMPLE_GH_ISSUES, wl["name"])[0], wl, {},
+        )
+        self.assertTrue(store1.insert(sig, ("slack",)))
+        with mock.patch.object(radar.time, "time", return_value=1000):
+            first_lease = store1.claim_notification(sig.fingerprint, "slack")
+            self.assertIsNotNone(first_lease)
+            self.assertIsNone(store2.claim_notification(sig.fingerprint, "slack"))
+        with mock.patch.object(radar.time, "time", return_value=1000 + radar.NOTIFICATION_LEASE_SECONDS):
+            next_lease = store2.claim_notification(sig.fingerprint, "slack")
+            self.assertIsNotNone(next_lease)
+            store1.finish_notification(sig.fingerprint, "slack", first_lease, True)
+            self.assertEqual(store2.query()[0]["notified"], 0)
+            store2.finish_notification(sig.fingerprint, "slack", next_lease, True)
+            self.assertEqual(store1.query()[0]["notified"], 1)
+
+    def test_existing_database_gets_queue_without_changing_signal_status(self):
+        store = radar.SignalStore(self.db_path)
+        wl = radar.BUILTIN_PRESETS["github-bounties"]
+        sig = radar.evaluate_signal(
+            radar.parse_github_issues_json(SAMPLE_GH_ISSUES, wl["name"])[0], wl, {},
+        )
+        self.assertTrue(store.insert(sig))
+        store.update_status(sig.fingerprint, "starred")
+        store.mark_notified(sig.fingerprint)
+        with store._connect() as conn:
+            conn.execute("DROP TABLE pending_notifications")
+
+        migrated = radar.SignalStore(self.db_path)
+        self.assertEqual(migrated.query(status="starred")[0]["notified"], 1)
+        self.assertEqual(migrated.pending_notifications([wl["name"]], ["slack"]), [])
 
     def test_web_dashboard_and_http_api(self):
         import contextlib, io, socket
@@ -316,6 +393,9 @@ class StoreScanWebAndCliTests(unittest.TestCase):
 
         _, after_body = raw_http("GET", "/api/stats")
         self.assertEqual(json.loads(after_body)["starred"], 1)
+        self.assertEqual(raw_http("GET", "/api/signals?limit=bad")[0], 400)
+        self.assertEqual(raw_http("POST", "/api/status", "[]")[0], 400)
+        self.assertEqual(raw_http("POST", "/api/scan", "{}")[0], 200)
 
     def test_cli_init_demo_and_list_subcommands(self):
         init_res = subprocess.run(
@@ -345,6 +425,23 @@ class StoreScanWebAndCliTests(unittest.TestCase):
         self.assertEqual(list_res.returncode, 0, list_res.stderr)
         payload = json.loads(list_res.stdout)
         self.assertGreaterEqual(payload["stats"]["act_now"], 2)
+
+    def test_documented_scan_command_and_exit_codes(self):
+        script = str(ROOT / "radar.py")
+        cmd = [sys.executable, script, "scan", "--config", self.cfg_path, "--db", self.db_path, "--json"]
+        missing = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("Could not load config", missing.stderr)
+        self.assertFalse(Path(self.db_path).exists())
+
+        Path(self.cfg_path).write_text('{"watchlists": []}', encoding="utf-8")
+        clean = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(clean.returncode, 0, clean.stderr)
+        self.assertEqual(json.loads(clean.stdout)["errors"], [])
+
+        failed = subprocess.run(cmd + ["--watchlist", "missing"], capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 1, failed.stderr)
+        self.assertIn("Unknown or disabled watchlist", json.loads(failed.stdout)["errors"][0])
 
 
 if __name__ == "__main__":
