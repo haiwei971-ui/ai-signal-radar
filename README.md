@@ -22,7 +22,7 @@ Most monitoring tools either require heavy Docker/Node/Playwright stacks that br
 **`ai-signal-radar` gives you the entire pipeline in one portable `radar.py` file (`0` pip packages required):**
 
 1. **Pull from clean, legal public feeds & APIs**: GitHub Issues Search API (`github_issues`), Hacker News Algolia API (`hn_algolia`), RSS 2.0 (`rss`), Atom (`atom`), or any custom JSON API (`json` with dot-path selectors).
-2. **Deduplicate in SQLite (WAL mode)**: Never see or get pinged about the same item twice.
+2. **Deduplicate in SQLite (WAL mode)**: Store each item once per watchlist and keep a persistent queue for undelivered alerts.
 3. **Two-stage scoring (Deterministic Rules → Optional LLM Triage)**:
    - Works **out of the box with zero API keys** via weighted keyword, exclusion, and max-price rules.
    - Optionally routes promising candidates (`score >= 35`) to **OpenAI / DeepSeek / OpenRouter / Groq / local Ollama (`$0` cost!) / Anthropic Claude / Google Gemini** to get a `0–100` score, `ACT_NOW | WATCH | SKIP` verdict, 1-line reason, and concrete next action.
@@ -116,8 +116,14 @@ Enable `"ai": { "enabled": true, ... }` in `watchlists.json`:
 Toggle any webhook in `watchlists.json` and export the matching environment variable (`TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`, `DISCORD_WEBHOOK_URL`, `SLACK_WEBHOOK_URL`, `FEISHU_WEBHOOK_URL`, or `BARK_SERVER_URL`), then run on a 15-minute cron:
 
 ```cron
-*/15 * * * * cd /path/to/ai-signal-radar && /usr/bin/env python3 radar.py scan --config watchlists.json --db radar.db >> radar.log 2>&1
+*/15 * * * * cd /path/to/ai-signal-radar && /usr/bin/env python3 radar.py --config watchlists.json --db radar.db scan >> radar.log 2>&1
 ```
+
+You can place `--config` and `--db` before or after `scan`. An explicitly supplied config path must exist. The scan exits with code `1` if a feed, scoring step, or notification reports an error, and the JSON report still contains successful results. An unreadable or invalid config exits with code `2`.
+
+Each enabled channel is queued independently for eligible new items. Later scans retry pending deliveries for enabled watchlists and channels, even when the feed no longer returns the item. Confirmed deliveries are removed from the queue. A provider may receive the same alert twice if it accepts a request just before Radar loses the response or stops. Existing databases gain the new queue automatically. Items stored before the upgrade keep their existing notification status.
+
+The dashboard defaults to loopback and has no built-in authentication. Use it locally or put it behind an authenticated reverse proxy for remote access.
 
 ---
 
