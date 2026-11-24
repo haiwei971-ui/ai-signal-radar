@@ -1,0 +1,96 @@
+{
+  "version": "1.0.0",
+  "ai": {
+    "enabled": false,
+    "provider": "openai_compatible",
+    "model": "gpt-4o-mini",
+    "base_url": "https://api.openai.com/v1",
+    "api_key_env": "OPENAI_API_KEY",
+    "min_rule_score_for_llm": 35,
+    "persona": "Pragmatic full-stack & AI tooling builder looking for well-scoped paid open-source bounties, high-intent developer leads, remote contracts, and undervalued hardware/software deals."
+  },
+  "notifications": {
+    "telegram": {
+      "enabled": false,
+      "bot_token_env": "TELEGRAM_BOT_TOKEN",
+      "chat_id_env": "TELEGRAM_CHAT_ID"
+    },
+    "discord": {
+      "enabled": false,
+      "webhook_url_env": "DISCORD_WEBHOOK_URL"
+    },
+    "slack": {
+      "enabled": false,
+      "webhook_url_env": "SLACK_WEBHOOK_URL"
+    },
+    "feishu": {
+      "enabled": false,
+      "webhook_url_env": "FEISHU_WEBHOOK_URL"
+    },
+    "bark": {
+      "enabled": false,
+      "server_url_env": "BARK_SERVER_URL"
+    }
+  },
+  "watchlists": [
+    {
+      "name": "github-bounties",
+      "description": "Newly opened GitHub issues offering cash bounties (Algora, Polar, $ labels)",
+      "type": "github_issues",
+      "query": "is:issue is:open label:bounty,\"💎 Bounty\",paid sort:created-desc",
+      "limit": 20,
+      "must_match_any": ["bounty", "$", "usd", "reward", "algora", "polar", "paid"],
+      "boost_keywords": {
+        "python": 15,
+        "typescript": 15,
+        "cli": 12,
+        "agent": 12,
+        "bug": 10,
+        "$": 18
+      },
+      "exclude_keywords": ["closed", "claimed"],
+      "ai_goal": "Find well-scoped open-source engineering bounties a solo Python/TS developer or coding agent can solve cleanly in 1-4 hours.",
+      "min_notify_score": 70
+    },
+    {
+      "name": "hn-buyer-leads",
+      "description": "Fresh Hacker News posts looking for tools, contractors, or AI coding workflows",
+      "type": "hn_algolia",
+      "query": "claude code OR coding agent OR freelance OR looking for tool",
+      "tags": "story",
+      "limit": 25,
+      "boost_keywords": {
+        "claude code": 22,
+        "cursor": 16,
+        "coding agent": 22,
+        "verify": 15,
+        "guardrail": 18,
+        "freelance": 20,
+        "contract": 18,
+        "budget": 18
+      },
+      "exclude_keywords": ["crypto giveaway"],
+      "ai_goal": "Spot high-intent developer pain points, consulting leads, or launch threads worth replying to early.",
+      "min_notify_score": 68
+    },
+    {
+      "name": "remote-usd-jobs",
+      "description": "Remote developer & AI engineering roles from public RSS feeds",
+      "type": "rss",
+      "url": "https://weworkremotely.com/categories/remote-back-end-programming-jobs.rss",
+      "limit": 20,
+      "boost_keywords": {
+        "python": 18,
+        "ai": 15,
+        "llm": 18,
+        "agent": 18,
+        "typescript": 14,
+        "contract": 15,
+        "worldwide": 16
+      },
+      "exclude_keywords": ["us only", "onsite"],
+      "ai_goal": "Surface worldwide remote backend/AI roles with strong async engineering culture or USD contract potential.",
+      "min_notify_score": 72
+    }
+  ]
+}
